@@ -320,6 +320,7 @@ nd
         and kwargs as explicit arguments.  Any kwargs passed to this function
         contain options for RQ itself.
         """
+        from .registry import FailedJobRegistry
 
         job = self.create_job(
             func, args=args, kwargs=kwargs, result_ttl=result_ttl, ttl=ttl,
@@ -348,6 +349,16 @@ nd
                         )
 
                         pipe.multi()
+
+                        for dependency in dependencies:
+                            if dependency.get_status(refresh=False) == JobStatus.FAILED:
+                                job.set_status(JobStatus.FAILED, pipeline=pipe)
+                                failed_job_registry = FailedJobRegistry(job.origin, job.connection,
+                                                                        job_class=self.job_class)
+                                failed_job_registry.add(job, ttl=job.failure_ttl,
+                                                        exc_string="Dependency has failed!", pipeline=pipe)
+                                pipe.execute()
+                                return job
 
                         for dependency in dependencies:
                             if dependency.get_status(refresh=False) != JobStatus.FINISHED:
@@ -544,6 +555,66 @@ nd
                     # exception as it it the responsibility of the caller to
                     # handle it
                     raise
+
+    def fail_dependents(self, job, pipeline=None):
+        """Fails all jobs in the given job's dependents set and clears it.
+
+        When called without a pipeline, this method uses WATCH/MULTI/EXEC.
+        If you pass a pipeline, only MULTI is called. The rest is up to the
+        caller.
+        """
+        from .registry import DeferredJobRegistry, FailedJobRegistry
+
+        pipe = pipeline if pipeline is not None else self.connection.pipeline()
+        dependents_key = job.dependents_key
+
+        while True:
+            try:
+                # if a pipeline is passed, the caller is responsible for calling WATCH
+                # to ensure all jobs are enqueued
+                if pipeline is None:
+                    pipe.watch(dependents_key)
+
+                dependent_job_ids = [as_text(_id)
+                                     for _id in pipe.smembers(dependents_key)]
+
+                jobs_to_fail = self.job_class.fetch_many(
+                    dependent_job_ids,
+                    connection=self.connection
+                )
+
+                pipe.multi()
+
+                for dependent in jobs_to_fail:
+                    deferred_job_registry = DeferredJobRegistry(dependent.origin,
+                                                                self.connection,
+                                                                job_class=self.job_class)
+                    deferred_job_registry.remove(dependent, pipeline=pipe)
+
+                    dependent.set_status(JobStatus.FAILED, pipeline=pipe)
+
+                    failed_job_registry = FailedJobRegistry(dependent.origin, dependent.connection,
+                                                            job_class=self.job_class)
+                    failed_job_registry.add(dependent, ttl=dependent.failure_ttl,
+                                            exc_string="Dependency has failed!", pipeline=pipe)
+
+                    self.fail_dependents(job=dependent)
+
+                pipe.delete(dependents_key)
+
+                if pipeline is None:
+                    pipe.execute()
+
+                break
+            except WatchError:
+                if pipeline is None:
+                    continue
+                else:
+                    # if the pipeline comes from the caller, we re-raise the
+                    # exception as it it the responsibility of the caller to
+                    # handle it
+                    raise
+        return len(dependent_job_ids)
 
     def pop_job_id(self):
         """Pops a given job ID from this Redis queue."""

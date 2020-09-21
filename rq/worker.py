@@ -884,6 +884,8 @@ class Worker(object):
                 # even if Redis is down
                 pass
 
+        queue.fail_dependents(job)
+
     def handle_job_success(self, job, queue, started_job_registry):
         self.log.debug('Handling successful execution of job %s', job.id)
         with self.connection.pipeline() as pipeline:
