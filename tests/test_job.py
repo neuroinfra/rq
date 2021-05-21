@@ -1,6 +1,4 @@
 # -*- coding: utf-8 -*-
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
 
 import json
 import time
@@ -12,7 +10,7 @@ from redis import WatchError
 
 from rq.compat import as_text
 from rq.exceptions import NoSuchJobError
-from rq.job import Job, JobStatus, cancel_job, get_current_job, Retry
+from rq.job import Job, JobStatus, cancel_job, get_current_job
 from rq.queue import Queue
 from rq.registry import (DeferredJobRegistry, FailedJobRegistry,
                          FinishedJobRegistry, StartedJobRegistry,
@@ -219,21 +217,8 @@ class TestJob(RQTestCase):
         self.assertEqual(job.last_heartbeat, None)
 
         ts = utcnow()
-        job.heartbeat(ts)
+        job.heartbeat(ts, 0)
         self.assertEqual(job.last_heartbeat, ts)
-
-    def test_persistence_of_retry_data(self):
-        """Retry related data is stored and restored properly"""
-        job = Job.create(func=fixtures.some_calculation)
-        job.retries_left = 3
-        job.retry_intervals = [1, 2, 3]
-        job.save()
-
-        job.retries_left = None
-        job.retry_intervals = None
-        job.refresh()
-        self.assertEqual(job.retries_left, 3)
-        self.assertEqual(job.retry_intervals, [1, 2, 3])
 
     def test_persistence_of_parent_job(self):
         """Storing jobs with parent job, either instance or key."""
@@ -432,6 +417,35 @@ class TestJob(RQTestCase):
         Job.fetch(job.id, connection=self.testconn)
         self.assertEqual(job.description, "tests.fixtures.say_hello('Lionel')")
 
+    def test_multiple_dependencies_are_accepted_and_persisted(self):
+        """Ensure job._dependency_ids accepts different input formats, and
+        is set and restored properly"""
+        job_A = Job.create(func=fixtures.some_calculation, args=(3, 1, 4), id="A")
+        job_B = Job.create(func=fixtures.some_calculation, args=(2, 7, 2), id="B")
+
+        # No dependencies
+        job = Job.create(func=fixtures.say_hello)
+        job.save()
+        Job.fetch(job.id, connection=self.testconn)
+        self.assertEqual(job._dependency_ids, [])
+
+        # Various ways of specifying dependencies
+        cases = [
+            ["A", ["A"]],
+            [job_A, ["A"]],
+            [["A", "B"], ["A", "B"]],
+            [[job_A, job_B], ["A", "B"]],
+            [["A", job_B], ["A", "B"]],
+            [("A", "B"), ["A", "B"]],
+            [(job_A, job_B), ["A", "B"]],
+            [(job_A, "B"), ["A", "B"]],
+        ]
+        for given, expected in cases:
+            job = Job.create(func=fixtures.say_hello, depends_on=given)
+            job.save()
+            Job.fetch(job.id, connection=self.testconn)
+            self.assertEqual(job._dependency_ids, expected)
+
     def test_prepare_for_execution(self):
         """job.prepare_for_execution works properly"""
         job = Job.create(func=fixtures.say_hello)
@@ -581,7 +595,6 @@ class TestJob(RQTestCase):
 
     def test_job_delete_removes_itself_from_registries(self):
         """job.delete() should remove itself from job registries"""
-        connection = self.testconn
         job = Job.create(func=fixtures.say_hello, status=JobStatus.FAILED,
                          connection=self.testconn, origin='default')
         job.save()
@@ -719,12 +732,35 @@ class TestJob(RQTestCase):
 
         self.assertRaises(TypeError, queue.enqueue, fixtures.say_hello, job_id=1234)
 
+    def test_create_job_with_async(self):
+        """test creating jobs with async function"""
+        queue = Queue(connection=self.testconn)
+
+        async_job = queue.enqueue(fixtures.say_hello_async, job_id="async_job")
+        sync_job = queue.enqueue(fixtures.say_hello, job_id="sync_job")
+
+        self.assertEqual(async_job.id, "async_job")
+        self.assertEqual(sync_job.id, "sync_job")
+
+        async_task_result = async_job.perform()
+        sync_task_result = sync_job.perform()
+
+        self.assertEqual(sync_task_result, async_task_result)
+
     def test_get_call_string_unicode(self):
         """test call string with unicode keyword arguments"""
         queue = Queue(connection=self.testconn)
 
         job = queue.enqueue(fixtures.echo,
                             arg_with_unicode=fixtures.UnicodeStringObject())
+        self.assertIsNotNone(job.get_call_string())
+        job.perform()
+
+    def test_create_job_from_static_method(self):
+        """test creating jobs with static method"""
+        queue = Queue(connection=self.testconn)
+
+        job = queue.enqueue(fixtures.ClassWithAStaticMethod.static_method)
         self.assertIsNotNone(job.get_call_string())
         job.perform()
 
@@ -784,7 +820,6 @@ class TestJob(RQTestCase):
         self.assertListEqual(dependencies, [dependency_job])
 
     def test_fetch_dependencies_returns_empty_if_not_dependent_job(self):
-        queue = Queue(connection=self.testconn)
         dependent_job = Job.create(func=fixtures.say_hello)
 
         dependent_job.register_dependency()
@@ -849,8 +884,6 @@ class TestJob(RQTestCase):
         self.assertFalse(dependencies_finished)
 
     def test_dependencies_finished_returns_true_if_no_dependencies(self):
-        queue = Queue(connection=self.testconn)
-
         dependent_job = Job.create(func=fixtures.say_hello)
         dependent_job.register_dependency()
 
@@ -894,8 +927,6 @@ class TestJob(RQTestCase):
         dependent_job = Job.create(func=fixtures.say_hello)
         dependent_job._dependency_ids = [job.id for job in dependency_jobs]
         dependent_job.register_dependency()
-
-        now = utcnow()
 
         dependencies_finished = dependent_job.dependencies_are_met()
 
@@ -943,48 +974,75 @@ class TestJob(RQTestCase):
 
         assert dependent_job.dependencies_are_met()
         assert dependent_job.get_status() == JobStatus.QUEUED
-    
-    def test_retry(self):
-        """Retry parses `max` and `interval` correctly"""
-        retry = Retry(max=1)
-        self.assertEqual(retry.max, 1)
-        self.assertEqual(retry.intervals, [0])
-        self.assertRaises(ValueError, Retry, max=0)
 
-        retry = Retry(max=2, interval=5)
-        self.assertEqual(retry.max, 2)
-        self.assertEqual(retry.intervals, [5])
+    def test_dependencies_are_met_at_execution_time(self):
+        queue = Queue(connection=self.testconn)
 
-        retry = Retry(max=3, interval=[5, 10])
-        self.assertEqual(retry.max, 3)
-        self.assertEqual(retry.intervals, [5, 10])
+        queue.enqueue(fixtures.say_hello, job_id="A")
+        queue.enqueue(fixtures.say_hello, job_id="B")
+        job_C = queue.enqueue(fixtures.check_dependencies_are_met, job_id="C", depends_on=["A", "B"])
 
-        # interval can't be negative
-        self.assertRaises(ValueError, Retry, max=1, interval=-5)
-        self.assertRaises(ValueError, Retry, max=1, interval=[1, -5])
-    
-    def test_get_retry_interval(self):
-        """get_retry_interval() returns the right retry interval"""
-        job = Job.create(func=fixtures.say_hello)
+        w = Worker([queue])
+        w.work(burst=True)
 
-        # Handle case where self.retry_intervals is None
-        job.retries_left = 2
-        self.assertEqual(job.get_retry_interval(), 0)
+        assert job_C.result
 
-        # Handle the most common case
-        job.retry_intervals = [1, 2]
-        self.assertEqual(job.get_retry_interval(), 1)
-        job.retries_left = 1
-        self.assertEqual(job.get_retry_interval(), 2)
-        
-        # Handle cases where number of retries > length of interval
-        job.retries_left = 4
-        job.retry_intervals = [1, 2, 3]
-        self.assertEqual(job.get_retry_interval(), 1)
-        job.retries_left = 3
-        self.assertEqual(job.get_retry_interval(), 1)
-        job.retries_left = 2
-        self.assertEqual(job.get_retry_interval(), 2)
-        job.retries_left = 1
-        self.assertEqual(job.get_retry_interval(), 3)
-        
+    def test_execution_order_with_sole_dependency(self):
+        queue = Queue(connection=self.testconn)
+        key = 'test_job:job_order'
+
+        # When there are no dependencies, the two fast jobs ("A" and "B") run in the order enqueued.
+        # Worker 1 will be busy with the slow job, so worker 2 will complete both fast jobs.
+        job_slow = queue.enqueue(fixtures.rpush, args=[key, "slow", True, 0.5], job_id='slow_job')
+        job_A = queue.enqueue(fixtures.rpush, args=[key, "A", True])
+        job_B = queue.enqueue(fixtures.rpush, args=[key, "B", True])
+        fixtures.burst_two_workers(queue)
+        time.sleep(0.75)
+        jobs_completed = [v.decode() for v in self.testconn.lrange(key, 0, 2)]
+        self.assertEqual(queue.count, 0)
+        self.assertTrue(all(job.is_finished for job in [job_slow, job_A, job_B]))
+        self.assertEqual(jobs_completed, ["A:w2", "B:w2", "slow:w1"])
+        self.testconn.delete(key)
+
+        # When job "A" depends on the slow job, then job "B" finishes before "A".
+        # There is no clear requirement on which worker should take job "A", so we stay silent on that.
+        job_slow = queue.enqueue(fixtures.rpush, args=[key, "slow", True, 0.5], job_id='slow_job')
+        job_A = queue.enqueue(fixtures.rpush, args=[key, "A", False], depends_on='slow_job')
+        job_B = queue.enqueue(fixtures.rpush, args=[key, "B", True])
+        fixtures.burst_two_workers(queue)
+        time.sleep(0.75)
+        jobs_completed = [v.decode() for v in self.testconn.lrange(key, 0, 2)]
+        self.assertEqual(queue.count, 0)
+        self.assertTrue(all(job.is_finished for job in [job_slow, job_A, job_B]))
+        self.assertEqual(jobs_completed, ["B:w2", "slow:w1", "A"])
+
+    def test_execution_order_with_dual_dependency(self):
+        queue = Queue(connection=self.testconn)
+        key = 'test_job:job_order'
+
+        # When there are no dependencies, the two fast jobs ("A" and "B") run in the order enqueued.
+        job_slow_1 = queue.enqueue(fixtures.rpush, args=[key, "slow_1", True, 0.5], job_id='slow_1')
+        job_slow_2 = queue.enqueue(fixtures.rpush, args=[key, "slow_2", True, 0.75], job_id='slow_2')
+        job_A = queue.enqueue(fixtures.rpush, args=[key, "A", True])
+        job_B = queue.enqueue(fixtures.rpush, args=[key, "B", True])
+        fixtures.burst_two_workers(queue)
+        time.sleep(1)
+        jobs_completed = [v.decode() for v in self.testconn.lrange(key, 0, 3)]
+        self.assertEqual(queue.count, 0)
+        self.assertTrue(all(job.is_finished for job in [job_slow_1, job_slow_2, job_A, job_B]))
+        self.assertEqual(jobs_completed, ["slow_1:w1", "A:w1", "B:w1", "slow_2:w2"])
+        self.testconn.delete(key)
+
+        # This time job "A" depends on two slow jobs, while job "B" depends only on the faster of
+        # the two. Job "B" should be completed before job "A".
+        # There is no clear requirement on which worker should take job "A", so we stay silent on that.
+        job_slow_1 = queue.enqueue(fixtures.rpush, args=[key, "slow_1", True, 0.5], job_id='slow_1')
+        job_slow_2 = queue.enqueue(fixtures.rpush, args=[key, "slow_2", True, 0.75], job_id='slow_2')
+        job_A = queue.enqueue(fixtures.rpush, args=[key, "A", False], depends_on=['slow_1', 'slow_2'])
+        job_B = queue.enqueue(fixtures.rpush, args=[key, "B", True], depends_on=['slow_1'])
+        fixtures.burst_two_workers(queue)
+        time.sleep(1)
+        jobs_completed = [v.decode() for v in self.testconn.lrange(key, 0, 3)]
+        self.assertEqual(queue.count, 0)
+        self.assertTrue(all(job.is_finished for job in [job_slow_1, job_slow_2, job_A, job_B]))
+        self.assertEqual(jobs_completed, ["slow_1:w1", "B:w1", "slow_2:w2", "A"])

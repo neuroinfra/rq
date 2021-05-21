@@ -18,6 +18,7 @@ from time import sleep
 
 from unittest import skipIf
 
+import redis.exceptions
 import pytest
 import mock
 from mock import Mock
@@ -37,8 +38,9 @@ from rq.registry import StartedJobRegistry, FailedJobRegistry, FinishedJobRegist
 from rq.suspension import resume, suspend
 from rq.utils import utcnow
 from rq.version import VERSION
-from rq.worker import HerokuWorker, WorkerStatus
+from rq.worker import HerokuWorker, WorkerStatus, RoundRobinWorker, RandomWorker
 from rq.serializers import JSONSerializer
+
 
 class CustomJob(Job):
     pass
@@ -284,6 +286,19 @@ class TestWorker(RQTestCase):
         w.refresh()
 
     @slow
+    def test_heartbeat_survives_lost_connection(self):
+        with mock.patch.object(Worker, 'heartbeat') as mocked:
+            # None -> Heartbeat is first called before the job loop
+            mocked.side_effect = [None, redis.exceptions.ConnectionError()]
+            q = Queue()
+            w = Worker([q])
+            w.work(burst=True)
+            # First call is prior to job loop, second raises the error,
+            # third is successful, after "recovery"
+            assert mocked.call_count == 3
+
+
+    @slow
     def test_heartbeat_busy(self):
         """Periodic heartbeats while horse is busy with long jobs"""
         q = Queue()
@@ -427,29 +442,6 @@ class TestWorker(RQTestCase):
         self.assertEqual([], queue.job_ids)
         # If a job is no longer retries, it's put in FailedJobRegistry
         self.assertTrue(job in registry)
-
-    def test_retry_interval(self):
-        """Retries with intervals are scheduled"""
-        connection = self.testconn
-        queue = Queue(connection=connection)
-        retry = Retry(max=1, interval=5)
-        job = queue.enqueue(div_by_zero, retry=retry)
-
-        worker = Worker([queue])
-        registry = queue.scheduled_job_registry
-        # If job if configured to retry with interval, it will be scheduled,
-        # not directly put back in the queue
-        queue.empty()
-        worker.handle_job_failure(job, queue)
-        job.refresh()
-        self.assertEqual(job.get_status(), JobStatus.SCHEDULED)
-        self.assertEqual(job.retries_left, 0)
-        self.assertEqual(len(registry), 1)
-        self.assertEqual(queue.job_ids, [])
-        # Scheduled time is roughly 5 seconds from now
-        scheduled_time = registry.get_scheduled_time(job)
-        now = datetime.now(timezone.utc)
-        self.assertTrue(now + timedelta(seconds=4) < scheduled_time < now + timedelta(seconds=6))
 
     def test_total_working_time(self):
         """worker.total_working_time is stored properly"""
@@ -757,22 +749,6 @@ class TestWorker(RQTestCase):
         # job status is also updated
         self.assertEqual(job._status, JobStatus.STARTED)
         self.assertEqual(job.worker_name, worker.name)
-
-    def test_prepare_job_execution_inf_timeout(self):
-        """Prepare job execution handles infinite job timeout"""
-        queue = Queue(connection=self.testconn)
-        job = queue.enqueue(long_running_job,
-                            args=(1,),
-                            job_timeout=-1)
-        worker = Worker([queue])
-        worker.prepare_job_execution(job)
-
-        # Updates working queue
-        registry = StartedJobRegistry(connection=self.testconn)
-        self.assertEqual(registry.get_job_ids(), [job.id])
-
-        # Score in queue is +inf
-        self.assertEqual(self.testconn.zscore(registry.key, job.id), float('Inf'))
 
     def test_work_unicode_friendly(self):
         """Worker processes work with unicode description, then quits."""
@@ -1348,3 +1324,58 @@ class TestExceptionHandlerMessageEncoding(RQTestCase):
     def test_handle_exception_handles_non_ascii_in_exception_message(self):
         """worker.handle_exception doesn't crash on non-ascii in exception message."""
         self.worker.handle_exception(Mock(), *self.exc_info)
+
+
+class TestRoundRobinWorker(RQTestCase):
+    def test_round_robin(self):
+        qs = [Queue('q%d' % i) for i in range(5)]
+
+        for i in range(5):
+            for j in range(3):
+                qs[i].enqueue(say_pid,
+                              job_id='q%d_%d' % (i, j))
+
+        w = RoundRobinWorker(qs)
+        w.work(burst=True)
+        start_times = []
+        for i in range(5):
+            for j in range(3):
+                job = Job.fetch('q%d_%d' % (i, j))
+                start_times.append(('q%d_%d' % (i, j), job.started_at))
+        sorted_by_time = sorted(start_times, key=lambda tup: tup[1])
+        sorted_ids = [tup[0] for tup in sorted_by_time]
+        expected = ['q0_0', 'q1_0', 'q2_0', 'q3_0', 'q4_0',
+                    'q0_1', 'q1_1', 'q2_1', 'q3_1', 'q4_1',
+                    'q0_2', 'q1_2', 'q2_2', 'q3_2', 'q4_2']
+        self.assertEqual(expected, sorted_ids)
+
+
+class TestRandomWorker(RQTestCase):
+    def test_random_worker(self):
+        qs = [Queue('q%d' % i) for i in range(5)]
+
+        for i in range(5):
+            for j in range(3):
+                qs[i].enqueue(say_pid,
+                              job_id='q%d_%d' % (i, j))
+
+        w = RandomWorker(qs)
+        w.work(burst=True)
+        start_times = []
+        for i in range(5):
+            for j in range(3):
+                job = Job.fetch('q%d_%d' % (i, j))
+                start_times.append(('q%d_%d' % (i, j), job.started_at))
+        sorted_by_time = sorted(start_times, key=lambda tup: tup[1])
+        sorted_ids = [tup[0] for tup in sorted_by_time]
+        expected_rr = ['q%d_%d' % (i, j) for j in range(3) for i in range(5)]
+        expected_ser = ['q%d_%d' % (i, j) for i in range(5) for j in range(3)]
+        self.assertNotEqual(sorted_ids, expected_rr)
+        self.assertNotEqual(sorted_ids, expected_ser)
+        expected_rr.reverse()
+        expected_ser.reverse()
+        self.assertNotEqual(sorted_ids, expected_rr)
+        self.assertNotEqual(sorted_ids, expected_ser)
+        sorted_ids.sort()
+        expected_ser.sort()
+        self.assertEqual(sorted_ids, expected_ser)

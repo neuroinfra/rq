@@ -8,8 +8,11 @@ import pickle
 import warnings
 import zlib
 
+import asyncio
 from collections.abc import Iterable
+from datetime import datetime, timedelta, timezone
 from distutils.version import StrictVersion
+from enum import Enum
 from functools import partial
 from uuid import uuid4
 
@@ -18,23 +21,24 @@ from .connections import resolve_connection
 from .exceptions import NoSuchJobError
 from .local import LocalStack
 from .serializers import resolve_serializer
-from .utils import (enum, get_version, import_attribute, parse_timeout, str_to_date,
-                    utcformat, utcnow)
+from .utils import (get_version, import_attribute, parse_timeout, str_to_date,
+                    utcformat, utcnow, ensure_list)
 
 # Serialize pickle dumps using the highest pickle protocol (binary, default
 # uses ascii)
 dumps = partial(pickle.dumps, protocol=pickle.HIGHEST_PROTOCOL)
 loads = pickle.loads
 
-JobStatus = enum(
-    'JobStatus',
-    QUEUED='queued',
-    FINISHED='finished',
-    FAILED='failed',
-    STARTED='started',
-    DEFERRED='deferred',
-    SCHEDULED='scheduled',
-)
+
+class JobStatus(str, Enum):
+    QUEUED = 'queued'
+    FINISHED = 'finished'
+    FAILED = 'failed'
+    STARTED = 'started'
+    DEFERRED = 'deferred'
+    SCHEDULED = 'scheduled'
+    STOPPED = 'stopped'
+
 
 # Sentinel value to mark that some of our lazily evaluated properties have not
 # yet been evaluated.
@@ -69,7 +73,7 @@ def requeue_job(job_id, connection):
     return job.requeue()
 
 
-class Job(object):
+class Job:
     """A Job is just a convenient datastructure to pass around job (meta) data.
     """
     redis_job_namespace_prefix = 'rq:job:'
@@ -106,7 +110,7 @@ class Job(object):
             job._instance = func.__self__
             job._func_name = func.__name__
         elif inspect.isfunction(func) or inspect.isbuiltin(func):
-            job._func_name = '{0}.{1}'.format(func.__module__, func.__name__)
+            job._func_name = '{0}.{1}'.format(func.__module__, func.__qualname__)
         elif isinstance(func, string_types):
             job._func_name = as_text(func)
         elif not inspect.isclass(func) and hasattr(func, '__call__'):  # a callable class instance
@@ -126,9 +130,10 @@ class Job(object):
         job._status = status
         job.meta = meta or {}
 
-        # dependency could be job instance or id
+        # dependency could be job instance or id, or iterable thereof
         if depends_on is not None:
-            job._dependency_ids = [depends_on.id if isinstance(depends_on, Job) else depends_on]
+            job._dependency_ids = [dep.id if isinstance(dep, Job) else dep
+                                   for dep in ensure_list(depends_on)]
         return job
 
     def get_position(self):
@@ -174,8 +179,12 @@ class Job(object):
         return self.get_status() == JobStatus.SCHEDULED
 
     @property
+    def is_stopped(self):
+        return self.get_status() == JobStatus.STOPPED
+
+    @property
     def _dependency_id(self):
-        """Returns the first item in self._dependency_ids. Present
+        """Returns the first item in self._dependency_ids. Present to
         preserve compatibility with third party packages..
         """
         if self._dependency_ids:
@@ -183,7 +192,7 @@ class Job(object):
 
     @property
     def dependency(self):
-        """Returns a job's dependency. To avoid repeated Redis fetches, we cache
+        """Returns a job's first dependency. To avoid repeated Redis fetches, we cache
         job.dependency as job._dependency.
         """
         if not self._dependency_ids:
@@ -346,7 +355,7 @@ class Job(object):
         self.ttl = None
         self.worker_name = None
         self._status = None
-        self._dependency_ids = []        
+        self._dependency_ids = []
         self.meta = {}
         self.serializer = resolve_serializer(serializer)
         self.retries_left = None
@@ -387,10 +396,11 @@ class Job(object):
             raise TypeError('id must be a string, not {0}'.format(type(value)))
         self._id = value
 
-    def heartbeat(self, heartbeat, pipeline=None):
+    def heartbeat(self, heartbeat, ttl, pipeline=None):
         self.last_heartbeat = heartbeat
         connection = pipeline if pipeline is not None else self.connection
         connection.hset(self.key, 'last_heartbeat', utcformat(self.last_heartbeat))
+        self.started_job_registry.add(self, ttl, pipeline=pipeline)
 
     id = property(get_id, set_id)
 
@@ -433,7 +443,7 @@ class Job(object):
             connection.watch(*self._dependency_ids)
 
         jobs = [job
-                for job in self.fetch_many(self._dependency_ids, connection=self.connection)
+                for job in self.fetch_many(self._dependency_ids, connection=self.connection, serializer=self.serializer)
                 if job]
 
         return jobs
@@ -491,15 +501,17 @@ class Job(object):
         if result:
             try:
                 self._result = self.serializer.loads(obj.get('result'))
-            except Exception as e:
+            except Exception:
                 self._result = "Unserializable return value"
         self.timeout = parse_timeout(obj.get('timeout')) if obj.get('timeout') else None
         self.result_ttl = int(obj.get('result_ttl')) if obj.get('result_ttl') else None  # noqa
         self.failure_ttl = int(obj.get('failure_ttl')) if obj.get('failure_ttl') else None  # noqa
         self._status = obj.get('status').decode() if obj.get('status') else None
 
-        dependency_id = obj.get('dependency_id', None)
-        self._dependency_ids = [as_text(dependency_id)] if dependency_id else []
+        dep_ids = obj.get('dependency_ids')
+        dep_id = obj.get('dependency_id')  # for backwards compatibility
+        self._dependency_ids = (json.loads(dep_ids.decode()) if dep_ids
+                                else [dep_id.decode()] if dep_id else [])
 
         self.ttl = int(obj.get('ttl')) if obj.get('ttl') else None
         self.meta = self.serializer.loads(obj.get('meta')) if obj.get('meta') else {}
@@ -571,7 +583,8 @@ class Job(object):
         if self._status is not None:
             obj['status'] = self._status
         if self._dependency_ids:
-            obj['dependency_id'] = self._dependency_ids[0]
+            obj['dependency_id'] = self._dependency_ids[0]  # for backwards compatibility
+            obj['dependency_ids'] = json.dumps(self._dependency_ids)
         if self.meta and include_meta:
             obj['meta'] = self.serializer.dumps(self.meta)
         if self.ttl:
@@ -716,7 +729,12 @@ class Job(object):
             pipeline.hmset(self.key, mapping)
 
     def _execute(self):
-        return self.func(*self.args, **self.kwargs)
+        result = self.func(*self.args, **self.kwargs)
+        if asyncio.iscoroutine(result):
+            loop = asyncio.get_event_loop()
+            coro_result = loop.run_until_complete(result)
+            return coro_result
+        return result
 
     def get_ttl(self, default_ttl=None):
         """Returns ttl for a job that determines how long a job will be
@@ -769,11 +787,17 @@ class Job(object):
             connection.expire(self.dependencies_key, ttl)
 
     @property
+    def started_job_registry(self):
+        from .registry import StartedJobRegistry
+        return StartedJobRegistry(self.origin, connection=self.connection,
+                                  job_class=self.__class__)
+
+    @property
     def failed_job_registry(self):
         from .registry import FailedJobRegistry
         return FailedJobRegistry(self.origin, connection=self.connection,
                                  job_class=self.__class__)
-    
+
     def get_retry_interval(self):
         """Returns the desired retry interval.
         If number of retries is bigger than length of intervals, the first
@@ -785,15 +809,26 @@ class Job(object):
         index = max(number_of_intervals - self.retries_left, 0)
         return self.retry_intervals[index]
 
+    def retry(self, queue, pipeline):
+        """Requeue or schedule this job for execution"""
+        retry_interval = self.get_retry_interval()
+        self.retries_left = self.retries_left - 1
+        if retry_interval:
+            scheduled_datetime = datetime.now(timezone.utc) + timedelta(seconds=retry_interval)
+            self.set_status(JobStatus.SCHEDULED)
+            queue.schedule_job(self, scheduled_datetime, pipeline=pipeline)
+        else:
+            queue.enqueue_job(self, pipeline=pipeline)
+
     def register_dependency(self, pipeline=None):
-        """Jobs may have dependencies. Jobs are enqueued only if the job they
-        depend on is successfully performed. We record this relation as
+        """Jobs may have dependencies. Jobs are enqueued only if the jobs they
+        depend on are successfully performed. We record this relation as
         a reverse dependency (a Redis set), with a key that looks something
         like:
 
             rq:job:job_id:dependents = {'job_id_1', 'job_id_2'}
 
-        This method adds the job in its dependency's dependents set
+        This method adds the job in its dependencies' dependents sets,
         and adds the job to DeferredJobRegistry.
         """
         from .registry import DeferredJobRegistry
@@ -851,16 +886,17 @@ class Job(object):
             if status
         )
 
+
 _job_stack = LocalStack()
 
 
-class Retry(object):
+class Retry:
     def __init__(self, max, interval=0):
         """`interval` can be a positive number or a list of ints"""
         super().__init__()
         if max < 1:
             raise ValueError('max: please enter a value greater than 0')
-        
+
         if isinstance(interval, int):
             if interval < 0:
                 raise ValueError('interval: negative numbers are not allowed')
@@ -870,6 +906,6 @@ class Retry(object):
                 if i < 0:
                     raise ValueError('interval: negative numbers are not allowed')
             intervals = interval
-        
+
         self.max = max
         self.intervals = intervals

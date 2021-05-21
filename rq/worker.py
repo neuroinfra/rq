@@ -13,16 +13,18 @@ import time
 import traceback
 import warnings
 
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from distutils.version import StrictVersion
+from enum import Enum
 from uuid import uuid4
+from random import shuffle
 
 try:
     from signal import SIGKILL
 except ImportError:
     from signal import SIGTERM as SIGKILL
 
-from redis import WatchError
+import redis.exceptions
 
 from . import worker_registration
 from .command import parse_payload, PUBSUB_CHANNEL_TEMPLATE, handle_command
@@ -40,7 +42,7 @@ from .registry import FailedJobRegistry, StartedJobRegistry, clean_registries
 from .scheduler import RQScheduler
 from .suspension import is_suspended
 from .timeouts import JobTimeoutException, HorseMonitorTimeoutException, UnixSignalDeathPenalty
-from .utils import (backend_class, ensure_list, enum, get_version,
+from .utils import (backend_class, ensure_list, get_version,
                     make_colorizer, utcformat, utcnow, utcparse)
 from .version import VERSION
 from .worker_registration import clean_worker_registry, get_keys
@@ -86,16 +88,14 @@ def signal_name(signum):
         return 'SIG_UNKNOWN'
 
 
-WorkerStatus = enum(
-    'WorkerStatus',
-    STARTED='started',
-    SUSPENDED='suspended',
-    BUSY='busy',
-    IDLE='idle'
-)
+class WorkerStatus(str, Enum):
+    STARTED = 'started'
+    SUSPENDED = 'suspended'
+    BUSY = 'busy'
+    IDLE = 'idle'
 
 
-class Worker(object):
+class Worker:
     redis_worker_namespace_prefix = 'rq:worker:'
     redis_workers_keys = worker_registration.REDIS_WORKER_KEYS
     death_penalty_class = UnixSignalDeathPenalty
@@ -106,6 +106,10 @@ class Worker(object):
     log_result_lifespan = True
     # `log_job_description` is used to toggle logging an entire jobs description.
     log_job_description = True
+    # factor to increase connection_wait_time incase of continous connection failures.
+    exponential_backoff_factor = 2.0
+    # Max Wait time (in seconds) after which exponential_backoff_factor wont be applicable.
+    max_connection_wait_time = 60.0
 
     @classmethod
     def all(cls, connection=None, job_class=None, queue_class=None, queue=None, serializer=None):
@@ -172,13 +176,6 @@ class Worker(object):
 
         self.redis_server_version = None
 
-        if prepare_for_work:
-            self.hostname = socket.gethostname()
-            self.pid = os.getpid()
-        else:
-            self.hostname = None
-            self.pid = None
-
         self.job_class = backend_class(self, 'job_class', override=job_class)
         self.queue_class = backend_class(self, 'queue_class', override=queue_class)
         self.version = VERSION
@@ -194,6 +191,7 @@ class Worker(object):
         self.name = name or uuid4().hex
         self.queues = queues
         self.validate_queues()
+        self._ordered_queues = self.queues[:]
         self._exc_handlers = []
 
         self.default_result_ttl = default_result_ttl
@@ -204,18 +202,31 @@ class Worker(object):
         self._is_horse = False
         self._horse_pid = 0
         self._stop_requested = False
+        self._stopped_job_id = None
+
         self.log = logger
         self.log_job_description = log_job_description
         self.last_cleaned_at = None
         self.successful_job_count = 0
         self.failed_job_count = 0
         self.total_working_time = 0
+        self.current_job_working_time = 0
         self.birth_date = None
         self.scheduler = None
         self.pubsub = None
         self.pubsub_thread = None
 
         self.disable_default_exception_handler = disable_default_exception_handler
+
+        if prepare_for_work:
+            self.hostname = socket.gethostname()
+            self.pid = os.getpid()
+            connection.client_setname(self.name)
+            self.ip_address = [client['addr'] for client in connection.client_list() if client['name'] == self.name][0]
+        else:
+            self.hostname = None
+            self.pid = None
+            self.ip_address = None
 
         if isinstance(exception_handlers, (list, tuple)):
             for handler in exception_handlers:
@@ -287,12 +298,13 @@ class Worker(object):
             now_in_string = utcformat(now)
             self.birth_date = now
 
-            mapping={
+            mapping = {
                 'birth': now_in_string,
                 'last_heartbeat': now_in_string,
                 'queues': queues,
                 'pid': self.pid,
                 'hostname': self.hostname,
+                'ip_address': self.ip_address,
                 'version': self.version,
                 'python_version': self.python_version,
             }
@@ -367,6 +379,11 @@ class Worker(object):
         return self.get_state()
 
     state = property(_get_state, _set_state)
+
+    def set_current_job_working_time(self, current_job_working_time, pipeline=None):
+        self.current_job_working_time = current_job_working_time
+        connection = pipeline if pipeline is not None else self.connection
+        connection.hset(self.key, 'current_job_working_time', current_job_working_time)
 
     def set_current_job_id(self, job_id, pipeline=None):
         connection = pipeline if pipeline is not None else self.connection
@@ -469,7 +486,6 @@ class Worker(object):
 
     def check_for_suspension(self, burst):
         """Check to see if workers have been suspended by `rq suspend`"""
-
         before_state = None
         notified = False
 
@@ -520,6 +536,9 @@ class Worker(object):
             self.pubsub.unsubscribe()
             self.pubsub.close()
 
+    def reorder_queues(self, reference_queue):
+        pass
+
     def work(self, burst=False, logging_level="INFO", date_format=DEFAULT_LOGGING_DATE_FORMAT,
              log_format=DEFAULT_LOGGING_FORMAT, max_jobs=None, with_scheduler=False):
         """Starts the work loop.
@@ -542,7 +561,7 @@ class Worker(object):
         if with_scheduler:
             self.scheduler = RQScheduler(
                 self.queues, connection=self.connection, logging_level=logging_level,
-                date_format=date_format, log_format=log_format)
+                date_format=date_format, log_format=log_format, serializer=self.serializer)
             self.scheduler.acquire_locks()
             # If lock is acquired, start scheduler
             if self.scheduler.acquired_locks:
@@ -576,6 +595,7 @@ class Worker(object):
                         break
 
                     job, queue = result
+                    self.reorder_queues(reference_queue=queue)
                     self.execute_job(job, queue)
                     self.heartbeat()
 
@@ -628,15 +648,16 @@ class Worker(object):
         self.set_state(WorkerStatus.IDLE)
         self.procline('Listening on ' + qnames)
         self.log.debug('*** Listening on %s...', green(qnames))
-
+        connection_wait_time = 1.0
         while True:
-            self.heartbeat()
-
-            if self.should_run_maintenance_tasks:
-                self.run_maintenance_tasks()
 
             try:
-                result = self.queue_class.dequeue_any(self.queues, timeout,
+                self.heartbeat()
+
+                if self.should_run_maintenance_tasks:
+                    self.run_maintenance_tasks()
+
+                result = self.queue_class.dequeue_any(self._ordered_queues, timeout,
                                                       connection=self.connection,
                                                       job_class=self.job_class,
                                                       serializer=self.serializer)
@@ -654,6 +675,14 @@ class Worker(object):
                 break
             except DequeueTimeout:
                 pass
+            except redis.exceptions.ConnectionError as conn_err:
+                self.log.error('Could not connect to Redis instance: %s Retrying in %d seconds...',
+                               conn_err, connection_wait_time)
+                time.sleep(connection_wait_time)
+                connection_wait_time *= self.exponential_backoff_factor
+                connection_wait_time = min(connection_wait_time, self.max_connection_wait_time)
+            else:
+                connection_wait_time = 1.0
 
         self.heartbeat()
         return result
@@ -679,13 +708,15 @@ class Worker(object):
     def refresh(self):
         data = self.connection.hmget(
             self.key, 'queues', 'state', 'current_job', 'last_heartbeat',
-            'birth', 'failed_job_count', 'successful_job_count',
-            'total_working_time', 'hostname', 'pid', 'version', 'python_version',
+            'birth', 'failed_job_count', 'successful_job_count', 'total_working_time',
+            'current_job_working_time', 'hostname', 'ip_address', 'pid', 'version', 'python_version',
         )
         (queues, state, job_id, last_heartbeat, birth, failed_job_count,
-         successful_job_count, total_working_time, hostname, pid, version, python_version) = data
+         successful_job_count, total_working_time, current_job_working_time,
+         hostname, ip_address, pid, version, python_version) = data
         queues = as_text(queues)
         self.hostname = as_text(hostname)
+        self.ip_address = as_text(ip_address)
         self.pid = int(pid) if pid else None
         self.version = as_text(version)
         self.python_version = as_text(python_version)
@@ -705,6 +736,8 @@ class Worker(object):
             self.successful_job_count = int(as_text(successful_job_count))
         if total_working_time:
             self.total_working_time = float(as_text(total_working_time))
+        if current_job_working_time:
+            self.current_job_working_time = float(as_text(current_job_working_time))
 
         if queues:
             self.queues = [self.queue_class(queue,
@@ -733,10 +766,17 @@ class Worker(object):
         if child_pid == 0:
             os.setsid()
             self.main_work_horse(job, queue)
-            os._exit(0) # just in case
+            os._exit(0)  # just in case
         else:
             self._horse_pid = child_pid
             self.procline('Forked {0} at {1}'.format(child_pid, time.time()))
+
+    def get_heartbeat_ttl(self, job):
+        if job.timeout and job.timeout > 0:
+            remaining_execution_time = job.timeout - self.current_job_working_time
+            return min(remaining_execution_time, self.job_monitoring_interval) + 60
+        else:
+            return self.job_monitoring_interval + 60
 
     def monitor_work_horse(self, job, queue):
         """The worker will monitor the work horse and make sure that it
@@ -754,9 +794,10 @@ class Worker(object):
             except HorseMonitorTimeoutException:
                 # Horse has not exited yet and is still running.
                 # Send a heartbeat to keep the worker alive.
+                self.set_current_job_working_time((utcnow() - job.started_at).total_seconds())
 
                 # Kill the job from this side if something is really wrong (interpreter lock/etc).
-                if job.timeout != -1 and (utcnow() - job.started_at).total_seconds() > (job.timeout + 60):
+                if job.timeout != -1 and self.current_job_working_time > (job.timeout + 60):
                     self.heartbeat(self.job_monitoring_interval + 60)
                     self.kill_horse()
                     self.wait_for_horse()
@@ -764,7 +805,8 @@ class Worker(object):
 
                 with self.connection.pipeline() as pipeline:
                     self.heartbeat(self.job_monitoring_interval + 60, pipeline=pipeline)
-                    job.heartbeat(utcnow(), pipeline=pipeline)
+                    ttl = self.get_heartbeat_ttl(job)
+                    job.heartbeat(utcnow(), ttl, pipeline=pipeline)
                     pipeline.execute()
 
             except OSError as e:
@@ -779,14 +821,21 @@ class Worker(object):
                 # Send a heartbeat to keep the worker alive.
                 self.heartbeat()
 
+        self.set_current_job_working_time(0)
         self._horse_pid = 0  # Set horse PID to 0, horse has finished working
         if ret_val == os.EX_OK:  # The process exited normally.
             return
         job_status = job.get_status()
         if job_status is None:  # Job completed and its ttl has expired
             return
-        if job_status not in [JobStatus.FINISHED, JobStatus.FAILED]:
-
+        elif job_status == JobStatus.STOPPED:
+            # Work-horse killed deliberately
+            self.log.warning('Job stopped by user, moving job to FailedJobRegistry')
+            self.handle_job_failure(
+                job, queue=queue,
+                exc_string="Job stopped by user, work-horse terminated."
+            )
+        elif job_status not in [JobStatus.FINISHED, JobStatus.FAILED]:
             if not job.ended_at:
                 job.ended_at = utcnow()
 
@@ -841,25 +890,20 @@ class Worker(object):
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
-    def prepare_job_execution(self, job, heartbeat_ttl=None):
+    def prepare_job_execution(self, job):
         """Performs misc bookkeeping like updating states prior to
         job execution.
         """
-        if job.timeout == -1:
-            timeout = -1
-        else:
-            timeout = job.timeout or 180
-
-        if heartbeat_ttl is None:
-            heartbeat_ttl = self.job_monitoring_interval + 60
 
         with self.connection.pipeline() as pipeline:
             self.set_state(WorkerStatus.BUSY, pipeline=pipeline)
             self.set_current_job_id(job.id, pipeline=pipeline)
+            self.set_current_job_working_time(0, pipeline=pipeline)
+
+            heartbeat_ttl = self.get_heartbeat_ttl(job)
             self.heartbeat(heartbeat_ttl, pipeline=pipeline)
-            registry = StartedJobRegistry(job.origin, self.connection,
-                                          job_class=self.job_class)
-            registry.add(job, timeout, pipeline=pipeline)
+            job.heartbeat(utcnow(), heartbeat_ttl, pipeline=pipeline)
+
             job.prepare_for_execution(self.name, pipeline=pipeline)
             pipeline.execute()
 
@@ -883,14 +927,19 @@ class Worker(object):
                     job_class=self.job_class
                 )
             job.worker_name = None
-            # Requeue/reschedule if retry is configured
-            if job.retries_left and job.retries_left > 0:
-                retry = True
-                retry_interval = job.get_retry_interval()
-                job.retries_left = job.retries_left - 1
+
+            # check whether a job was stopped intentionally and set the job
+            # status appropriately if it was this job.
+            job_is_stopped = self._stopped_job_id == job.id
+            retry = job.retries_left and job.retries_left > 0 and not job_is_stopped
+
+            if job_is_stopped:
+                job.set_status(JobStatus.STOPPED, pipeline=pipeline)
+                self._stopped_job_id = None
             else:
-                retry = False
-                job.set_status(JobStatus.FAILED, pipeline=pipeline)
+                # Requeue/reschedule if retry is configured, otherwise
+                if not retry:
+                    job.set_status(JobStatus.FAILED, pipeline=pipeline)
 
             started_job_registry.remove(job, pipeline=pipeline)
 
@@ -908,12 +957,7 @@ class Worker(object):
                 )
 
             if retry:
-                if retry_interval:
-                    scheduled_datetime = datetime.now(timezone.utc) + timedelta(seconds=retry_interval)
-                    job.set_status(JobStatus.SCHEDULED)
-                    queue.schedule_job(job, scheduled_datetime, pipeline=pipeline)
-                else:
-                    queue.enqueue_job(job, pipeline=pipeline)
+                job.retry(queue, pipeline)
 
             try:
                 pipeline.execute()
@@ -957,10 +1001,10 @@ class Worker(object):
 
                     pipeline.execute()
                     break
-                except WatchError:
+                except redis.exceptions.WatchError:
                     continue
 
-    def perform_job(self, job, queue, heartbeat_ttl=None):
+    def perform_job(self, job, queue):
         """Performs the actual work of a job.  Will/should only be called
         inside the work horse's process.
         """
@@ -969,7 +1013,7 @@ class Worker(object):
         started_job_registry = queue.started_job_registry
 
         try:
-            self.prepare_job_execution(job, heartbeat_ttl)
+            self.prepare_job_execution(job)
 
             job.started_at = utcnow()
             timeout = job.timeout or self.queue_class.DEFAULT_TIMEOUT
@@ -1015,7 +1059,7 @@ class Worker(object):
     def handle_exception(self, job, *exc_info):
         """Walks the exception handler stack to delegate exception handling."""
         exc_string = ''.join(traceback.format_exception(*exc_info))
-        self.log.error(exc_string, exc_info=True, extra={
+        self.log.error(exc_string, extra={
             'func': job.func_name,
             'arguments': job.args,
             'kwargs': job.kwargs,
@@ -1084,12 +1128,14 @@ class SimpleWorker(Worker):
 
     def execute_job(self, job, queue):
         """Execute job in same thread/process, do not fork()"""
+        return self.perform_job(job, queue)
+
+    def get_heartbeat_ttl(self, job):
         # "-1" means that jobs never timeout. In this case, we should _not_ do -1 + 60 = 59. We should just stick to DEFAULT_WORKER_TTL.
         if job.timeout == -1:
-            timeout = DEFAULT_WORKER_TTL
+            return DEFAULT_WORKER_TTL
         else:
-            timeout = (job.timeout or DEFAULT_WORKER_TTL) + 60
-        return self.perform_job(job, queue, heartbeat_ttl=timeout)
+            return (job.timeout or DEFAULT_WORKER_TTL) + 60
 
 
 class HerokuWorker(Worker):
@@ -1135,3 +1181,21 @@ class HerokuWorker(Worker):
         info = dict((attr, getattr(frame, attr)) for attr in self.frame_properties)
         self.log.warning('raising ShutDownImminentException to cancel job...')
         raise ShutDownImminentException('shut down imminent (signal: %s)' % signal_name(signum), info)
+
+
+class RoundRobinWorker(Worker):
+    """
+    Modified version of Worker that dequeues jobs from the queues using a round-robin strategy.
+    """
+    def reorder_queues(self, reference_queue):
+        pos = self._ordered_queues.index(reference_queue)
+        self._ordered_queues = self._ordered_queues[pos + 1:] + self._ordered_queues[:pos + 1]
+
+
+class RandomWorker(Worker):
+    """
+    Modified version of Worker that dequeues jobs from the queues using a random strategy.
+    """
+
+    def reorder_queues(self, reference_queue):
+        shuffle(self._ordered_queues)
